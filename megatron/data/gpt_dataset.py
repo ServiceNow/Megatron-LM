@@ -394,71 +394,70 @@ class GPTDataset(torch.utils.data.Dataset):
         eod = self.tokenizer.eod
         segment_breaks = np.argwhere(sample == eod) # split sample by document
 
-        if self.fim_rate == 0:
-            return sample.astype(np.int64)
-    
-        def fim_permute_sequence(sequence, rate):
-            return permute(
-                sequence,
-                self.np_rng,
-                rate,
-                self.fim_spm_rate,
-                self.tokenizer,
-                truncate_or_pad=False,
-                suffix_tok_id=self.suffix_tok_id,
-                prefix_tok_id=self.prefix_tok_id,
-                middle_tok_id=self.middle_tok_id,
-                pad_tok_id=self.pad_tok_id,
-            )
+        if self.fim_rate != 0:
 
-        def fim_split_and_permute_sequence(sequence):
-            """
-            If self.fim_split_sample is not None, split the sequence.
-            Then apply FIM on the fragments, or the whole sequence if self.fim_split_sample is None.
-            """
-            if self.fim_split_sample is None:
-                return fim_permute_sequence(sequence, self.fim_rate)
-            # fim_split_sample is set: split the sample on this token and permute each fragment separately.
-            # Typically, if each sample is a repository, then we split again on the file level.
-            # Each fragment is a file, and we permute the files.
-            fragment_breaks = np.argwhere(sequence == self.fim_split_sample)
-            if fragment_breaks.shape == (0, 1):
-                # no split token in this sample
-                return fim_permute_sequence(sequence, self.fim_rate)
-            if not self.np_rng.binomial(1, self.fim_rate):
-                # don't do FIM preproc
-                return sequence
-            # Do FIM on each fragment
-            curr_start_position = 0
-            new_samples = []
-            for loc in np.nditer(fragment_breaks):
-                if loc - curr_start_position > 0:
-                    permuted = fim_permute_sequence(sequence[curr_start_position:loc], self.fragment_fim_rate)
-                    new_samples += [permuted, [self.fim_split_sample]]
-                curr_start_position = loc + 1  # Jump over the split token
-            # Permute the segment after the last split token
-            permuted = fim_permute_sequence(sequence[curr_start_position:], self.fragment_fim_rate)
-            new_samples.append(permuted)
-            return np.concatenate(new_samples)
+            def fim_permute_sequence(sequence, rate):
+                return permute(
+                    sequence,
+                    self.np_rng,
+                    rate,
+                    self.fim_spm_rate,
+                    self.tokenizer,
+                    truncate_or_pad=False,
+                    suffix_tok_id=self.suffix_tok_id,
+                    prefix_tok_id=self.prefix_tok_id,
+                    middle_tok_id=self.middle_tok_id,
+                    pad_tok_id=self.pad_tok_id,
+                )
 
-        if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
-            curr_start_position = 0
-            new_samples = []
-            for loc in np.nditer(segment_breaks):
-                # Only permute non-empty segments.
-                if loc - curr_start_position > 0:
-                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                    permuted = fim_split_and_permute_sequence(sample[curr_start_position:loc])
-                    new_samples += [permuted, [eod]]
+            def fim_split_and_permute_sequence(sequence):
+                """
+                If self.fim_split_sample is not None, split the sequence.
+                Then apply FIM on the fragments, or the whole sequence if self.fim_split_sample is None.
+                """
+                if self.fim_split_sample is None:
+                    return fim_permute_sequence(sequence, self.fim_rate)
+                # fim_split_sample is set: split the sample on this token and permute each fragment separately.
+                # Typically, if each sample is a repository, then we split again on the file level.
+                # Each fragment is a file, and we permute the files.
+                fragment_breaks = np.argwhere(sequence == self.fim_split_sample)
+                if fragment_breaks.shape == (0, 1):
+                    # no split token in this sample
+                    return fim_permute_sequence(sequence, self.fim_rate)
+                if not self.np_rng.binomial(1, self.fim_rate):
+                    # don't do FIM preproc
+                    return sequence
+                # Do FIM on each fragment
+                curr_start_position = 0
+                new_samples = []
+                for loc in np.nditer(fragment_breaks):
+                    if loc - curr_start_position > 0:
+                        permuted = fim_permute_sequence(sequence[curr_start_position:loc], self.fragment_fim_rate)
+                        new_samples += [permuted, [self.fim_split_sample]]
+                    curr_start_position = loc + 1  # Jump over the split token
+                # Permute the segment after the last split token
+                permuted = fim_permute_sequence(sequence[curr_start_position:], self.fragment_fim_rate)
+                new_samples.append(permuted)
+                return np.concatenate(new_samples)
 
-                curr_start_position = loc + 1  # jump over the EOD token
-            # Permute the segment after the last EOD
-            permuted = fim_split_and_permute_sequence(sample[curr_start_position:])
-            new_samples.append(permuted)
+            if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
+                curr_start_position = 0
+                new_samples = []
+                for loc in np.nditer(segment_breaks):
+                    # Only permute non-empty segments.
+                    if loc - curr_start_position > 0:
+                        # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                        permuted = fim_split_and_permute_sequence(sample[curr_start_position:loc])
+                        new_samples += [permuted, [eod]]
 
-            sample = np.concatenate(new_samples)
-        else:
-            sample = fim_split_and_permute_sequence(sample)
+                    curr_start_position = loc + 1  # jump over the EOD token
+                # Permute the segment after the last EOD
+                permuted = fim_split_and_permute_sequence(sample[curr_start_position:])
+                new_samples.append(permuted)
+
+                sample = np.concatenate(new_samples)
+            else:
+                sample = fim_split_and_permute_sequence(sample)
             
         # Truncate or pad sequence to max-length
         diff = sample.shape[0] - sample_len
