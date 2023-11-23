@@ -4,6 +4,7 @@
 
 import logging
 import logging.config
+import math
 import random
 import os
 import sys
@@ -11,6 +12,7 @@ import time
 
 import numpy as np
 import torch
+import torch.distributed
 from datetime import timedelta
 
 try:
@@ -96,16 +98,20 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
 def _configure_logging():
     args=get_args()
-    if not args.structured_logs:
-        return
     rank = torch.distributed.get_rank()
+    if args.structured_logs:
+        world_size=torch.distributed.get_world_size()
+        rank_str = str(rank).zfill(math.ceil(math.log10(world_size)))
+        format = f"%(asctime)s {'' if world_size==1 else f'[Rank {rank_str}] '}%(message)s"
+    else:
+        format=None
 
     logging_config = {
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {
             "default": {
-                "format": f"%(asctime)s [Rank {rank}]: %(message)s",
+                "format": format,
                 "use_colors": True,
             }
         },
@@ -133,13 +139,13 @@ def _configure_logging():
         logging_config["loggers"]["default"]["handlers"].append("file")
     logging.config.dictConfig(logging_config)
 
-    # Add these methods so that stdout can be redirected to logging.
-    logging.write = lambda msg: logging.info(msg) if msg != '\n' else None
-    logging.flush = lambda : None
+    if args.structured_logs:
+        # Add these methods so that stdout can be redirected to logging.
+        logging.write = lambda msg: logging.info(msg) if msg != '\n' else None
+        logging.flush = lambda : None
 
-    sys.stdout=logging
-    sys.stderr=logging
-
+        sys.stdout=logging
+        sys.stderr=logging
 
 
 def _compile_dependencies():
@@ -298,6 +304,10 @@ def write_args_to_tensorboard():
 
 def init_wandb():
     args = get_args()
+    # Wandb login from file
+    api_key_path = os.environ.get("WANDB_API_KEY_PATH")
+    if api_key_path:
+        os.environ["WANDB_API_KEY"]=open(api_key_path,"r").read().strip()
     if args.rank == (args.world_size - 1):
         if not (args.wandb_entity_name and args.wandb_project_name):
             print('> Skipping wandb init ...', flush=True)
@@ -306,7 +316,7 @@ def init_wandb():
             name=os.path.basename(args.save),
             entity=args.wandb_entity_name,
             project=args.wandb_project_name,
-            group="mini_cluster",
+            group=args.wandb_group_name,
             config=args
         )
 
@@ -332,7 +342,11 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    # Prevent the function from messing up the random state.
+
+    tensor_parallel.get_cuda_rng_tracker().add("Warmup jit", 0)
+    with tensor_parallel.get_cuda_rng_tracker().fork("Warmup jit"):
+        _warmup_jit_function()
 
 
 def _warmup_jit_function():

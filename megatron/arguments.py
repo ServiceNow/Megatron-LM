@@ -11,11 +11,15 @@ import torch
 import types
 
 from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
 
 import megatron
 from megatron.model.enums import PositionEmbeddingType
+
+
+def get_args_path(workdir):
+    '''Argument copy stored within retro workdir.'''
+    return os.path.join(workdir, "args.json")
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -697,6 +701,8 @@ def _add_logging_args(parser):
                         help="Name of wandb entity for reporting")
     group.add_argument('--wandb-project-name', type=str, default=None,
                         help="Name of wandb project")
+    group.add_argument('--wandb-group-name', type=str, default="default",
+                        help="Name of wandb entity for reporting")
     group.add_argument('--transformer-timers', action='store_true',
                         help="If set, activate the timers within the transformer layers."
                         "Only for debugging, as this slows down the model.")
@@ -704,6 +710,12 @@ def _add_logging_args(parser):
                        help='Add timestamp and worker name to stdout and stderr.')
     group.add_argument('--structured-logs-dir', type=str, default=None,
                        help='Directory to save the logs.')
+    group.add_argument('--debug_layer_outputs', '--debug-layer-outputs', type=int, default=0)
+    group.add_argument('--debug_layer_gradients', '--debug-layer-gradients', type=int, default=0)
+    group.add_argument('--debug_all_param_gradients', '--debug-all-param-gradients', type=int, default=0)
+    group.add_argument('--debug_param_init', '--debug-param-init', type=int, default=0)
+    group.add_argument('--debug_param_update', '--debug-param-update', type=int, default=0)
+    group.add_argument('--debug_transformer', '--debug-transformer', type=int, default=0)
 
     return parser
 
