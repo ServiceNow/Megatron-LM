@@ -404,6 +404,8 @@ def validate_args(args, defaults={}):
     if args.use_flash_attn:
         assert not args.reset_attention_mask, \
             "Flash Attention doesn't support arbitrary attention masks. Please turn off reset-attention-mask"
+    else:
+        assert args.window_size is None
 
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
@@ -583,6 +585,7 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
+    group.add_argument('--window-size', type=int, default=None)
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not')
     group.add_argument('--rotary-percent', type=float, default=1.0,

@@ -521,6 +521,10 @@ class FlashSelfAttention(torch.nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+        self.window_size=get_args().window_size
+        if self.window_size is not None:
+            assert FLASH_VERSION>=2
+
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -547,7 +551,9 @@ class FlashSelfAttention(torch.nn.Module):
             is_causal = self.causal and (seqlen_q == seqlen_k)
             dropout_p = 0
 
-        output = flash_attn_func(q, k, v, dropout_p,softmax_scale=self.softmax_scale, causal=is_causal)
+        output = flash_attn_func(q, k, v, dropout_p,softmax_scale=self.softmax_scale, causal=is_causal,
+            window_size=(-1, -1) if self.window_size is None else (self.window_size - 1, 0),
+        )
 
         return output
 
