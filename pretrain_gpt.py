@@ -12,9 +12,11 @@ from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets, build_dataset_group
 from megatron.model import GPTModel
+from megatron.tensor_logging import log_tensor, run_and_log_exception
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
+
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -65,10 +67,13 @@ def loss_func(loss_mask, output_tensor):
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
+    args = get_args()
+    log_tensor(f"Global layer {args.num_layers+1} fw: Loss", loss, level=args.debug_layer_outputs)
+
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
-    return loss, {'lm loss': averaged_loss[0]}
+    return loss, {'loss': averaged_loss[0]}
 
 
 def forward_step(data_iterator, model):
@@ -144,10 +149,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
-if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+if __name__ == "__main__":
+    with run_and_log_exception():
+        pretrain(train_valid_test_datasets_provider,
+                 model_provider,
+                 ModelType.encoder_or_decoder,
+                 forward_step,
+                 args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

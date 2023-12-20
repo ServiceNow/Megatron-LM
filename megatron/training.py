@@ -4,6 +4,7 @@
 
 from datetime import datetime
 import math
+import os
 import sys
 import time
 
@@ -14,6 +15,7 @@ except ModuleNotFoundError:
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import torch.distributed
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -46,7 +48,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.data.dataset_utils import analyze_data_prefix
-
+from megatron.tensor_logging import get_logged_tensor_stats, reset_tensor_stats_logging
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -112,6 +114,9 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
+    if args.structured_logs_dir is not None:
+        reset_tensor_stats_logging()
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -149,6 +154,7 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     iteration = 0
+    save_tensor_logs("init")
 
     if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
         args.train_iters = args.retro_cyclic_train_iters
@@ -182,6 +188,18 @@ def pretrain(train_valid_test_dataset_provider,
             evaluate_and_print_results(prefix, forward_step_func,
                                        iterator, model,
                                        0, process_non_loss_data_func, True, data_group_name=name)
+
+
+
+def save_tensor_logs(step:str|int):
+    args=get_args()
+    if args.structured_logs_dir is not None and (tensor_log_stats:=get_logged_tensor_stats()):
+        tensor_logs_dir = os.path.join(args.structured_logs_dir, f"runs/0/artifacts/{torch.distributed.get_rank()}")
+        os.makedirs(tensor_logs_dir, exist_ok=True)
+        torch.save(tensor_log_stats, os.path.join(tensor_logs_dir, f"tensor_logs_{step}.pt"))
+        reset_tensor_stats_logging()
+
+
 
 def update_train_iters(args):
 
@@ -646,13 +664,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        loss_dict_avg={}
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
-                avg = total_loss_dict[key].item() / \
+                loss_dict_avg[key] = total_loss_dict[key].item() / \
                       float(max(1, total_loss_dict[advanced_iters_key]))
-                if avg > 0.0:
-                    log_string += ' {}: {:.6E} |'.format(key, avg)
+                if loss_dict_avg[key] > 0.0:
+                    log_string += ' {}: {:.6E} |'.format(key, loss_dict_avg[key])
                 total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
@@ -679,18 +698,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
 
-    # Weights and biases reporting
-    if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
-        metrics = {
-            'learning-rate': learning_rate,
-            'samples': args.consumed_train_samples,
-            'loss-scale': loss_scale,
-            'grad-norm': grad_norm,
-            'tflops': tflops,
-            'tokens-per-second-per-gpu': tokens_per_sec_per_gpu, 
-            **loss_dict
-        }
-        wandb.log(metrics, step=iteration)
+        # Weights and biases reporting
+        if is_last_rank() and args.wandb_project_name:
+            metrics = {
+                'learning_rate': learning_rate,
+                'consumed_samples': args.consumed_train_samples,
+                'loss_scale': loss_scale,
+                'grad_norm': grad_norm,
+                'common_tflops': tflops,
+                'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+                **loss_dict_avg
+            }
+            wandb.log({"Training":metrics}, step=iteration)
     return report_memory_flag
 
 
@@ -731,6 +750,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:
+        lr=optimizer.param_groups[0]['lr']
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
@@ -750,10 +770,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         report_memory_flag = training_log(loss_dict, total_loss_dict,
-                                          optimizer.param_groups[0]['lr'],
+                                          lr,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
+        save_tensor_logs(iteration)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -917,9 +939,9 @@ def evaluate_and_print_results(prefix, forward_step_func,
     
     # Weights and biases reporting
     if is_last_rank() and args.wandb_project_name:
-        metrics = {
-            f'{tf_plot_prefix}/{key} validation': total_loss_dict[key].item() for key in total_loss_dict
-        }
+        metrics = {("Test" if "test" in prefix else "Validation"):{
+            key: total_loss_dict[key].item() for key in total_loss_dict
+        }}
         wandb.log(metrics, step=iteration)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():

@@ -20,6 +20,8 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_linear_layer
+from megatron.tensor_logging import log_tensor
+
 
 from .glu_activations import GLU_ACTIVATIONS
 
@@ -519,6 +521,10 @@ class FlashSelfAttention(torch.nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+        self.window_size=get_args().window_size
+        if self.window_size is not None:
+            assert FLASH_VERSION>=2
+
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -545,7 +551,9 @@ class FlashSelfAttention(torch.nn.Module):
             is_causal = self.causal and (seqlen_q == seqlen_k)
             dropout_p = 0
 
-        output = flash_attn_func(q, k, v, dropout_p,softmax_scale=self.softmax_scale, causal=is_causal)
+        output = flash_attn_func(q, k, v, dropout_p,softmax_scale=self.softmax_scale, causal=is_causal,
+            window_size=(-1, -1) if self.window_size is None else (self.window_size - 1, 0),
+        )
 
         return output
 
@@ -602,6 +610,7 @@ class ParallelAttention(MegatronModule):
         self.params_dtype = args.params_dtype
         self.attention_head_type = args.attention_head_type
         self.sequence_parallel = args.sequence_parallel
+        self._debug_transformer=args.debug_transformer
 
         self.use_flash_attn = args.use_flash_attn
 
@@ -671,7 +680,7 @@ class ParallelAttention(MegatronModule):
         else:
             self.core_attention = MultiQueryCoreAttention(self.layer_number, self.attn_mask_type)
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
-        
+
         if self.use_flash_attn:
             if FLASH_VERSION is None:
                 raise ImportError('FlashAttention is not installed, please install with '
@@ -684,7 +693,7 @@ class ParallelAttention(MegatronModule):
                 ('FlashAttention does not support alibi positional embeddings yet')
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
-            
+
             if self.checkpoint_core_attention:
                 print_rank_0("  Warning, using selective recomputation with flash-attn: this is already handled in the "
                              "flash-attn library and has no effect.")
@@ -908,10 +917,7 @@ class ParallelAttention(MegatronModule):
                 sq, b, np, hn = query_layer.size()
                 # Expand kv to be compatible with flash-attn implementation
                 # [sq, b, 1, hn] -> [sq, b, np, hn]
-                # TODO: This should be skippable for flash 2, but getting illegal memory access.
-                key_layer = key_layer.expand((sq, b, np, hn))
-                value_layer = value_layer.expand((sq, b, np, hn))
-            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+            q, k, v = [x.transpose(0,1).contiguous()
                        for x in (query_layer, key_layer, value_layer)]
             if self.sequence_parallel:
                 context_layer = self.core_attention_flash(q, k, v)
@@ -928,6 +934,11 @@ class ParallelAttention(MegatronModule):
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask, alibi)
 
+        if self._debug_transformer:
+            log_tensor(f"Layer {self.layer_number} Query", query_layer, level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Key", key_layer, level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Value", value_layer, level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Attn context", context_layer, level=self._debug_transformer)
 
         # =================
         # Output. [sq, b, h]
@@ -985,6 +996,7 @@ class ParallelTransformerLayer(MegatronModule):
         super(ParallelTransformerLayer, self).__init__()
         self.layer_number = layer_number
         self.layer_type = layer_type
+        self._debug_transformer=args.debug_transformer
 
         self.apply_residual_connection_post_layernorm \
             = args.apply_residual_connection_post_layernorm
@@ -1059,7 +1071,7 @@ class ParallelTransformerLayer(MegatronModule):
                 self.alibi = self.alibi.to(torch.bfloat16)
         else:
             self.alibi = None
-        
+
         if args.retro_add_retriever:
             retro_args = get_retro_args()
             self.retro_num_neighbors = args.retro_num_neighbors
@@ -1309,6 +1321,13 @@ class ParallelTransformerLayer(MegatronModule):
                 alibi=self.alibi,
                 rotary_pos_emb=rotary_pos_emb)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} Attn output",
+                hidden_states + attention_bias,
+                level=self._debug_transformer
+            )
+
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -1341,6 +1360,9 @@ class ParallelTransformerLayer(MegatronModule):
                                               p=self.hidden_dropout,
                                               training=self.training)
             layernorm_input = residual + self.drop_path(out)
+
+        if self._debug_transformer:
+            log_tensor(f"Layer {self.layer_number} Attn residual", layernorm_input, level=self._debug_transformer)
 
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
@@ -1381,6 +1403,13 @@ class ParallelTransformerLayer(MegatronModule):
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} MLP output",
+                mlp_output + mlp_bias,
+                level=self._debug_transformer
+            )
+
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -1415,6 +1444,7 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
+
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
         else:
@@ -1441,12 +1471,12 @@ class ParallelTransformerLayer(MegatronModule):
         slopes = torch.Tensor(get_slopes(num_attention_heads))
         alibi = slopes.unsqueeze(1).unsqueeze(1) * torch.arange(max_seq_len).unsqueeze(0).unsqueeze(0).expand(
             num_attention_heads, -1, -1)
-        
+
         #Select the part of the tensor that corresponds to our tensor parallel index.
         tp_world_size = mpu.get_tensor_model_parallel_world_size()
         tp_index = mpu.get_tensor_model_parallel_rank()
         alibi = alibi.reshape((tp_world_size, -1, *alibi.shape[1:]))[tp_index]
-        
+
         alibi = alibi.repeat(batch_size, 1, 1)
         return alibi
 
@@ -1845,6 +1875,14 @@ class ParallelTransformer(MegatronModule):
         timers = get_timers()
         args = get_args()
 
+        if args.debug_layer_outputs:
+            log_tensor(f"Global layer 0 fw: Embedding output", hidden_states.transpose(0, 1), level=args.debug_layer_outputs)
+        if args.debug_layer_gradients:
+            hidden_states.register_hook(lambda grad: log_tensor(
+                f"Global layer 1 bw: Embedding output",
+                grad.transpose(0, 1), level=args.debug_layer_gradients
+            ))
+
         if args.transformer_timers: timers("Transformer forward").start()
 
         # Checks.
@@ -1933,6 +1971,18 @@ class ParallelTransformer(MegatronModule):
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
+
+                        if args.debug_layer_outputs:
+                            log_tensor(
+                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                hidden_states.transpose(0, 1), level=args.debug_layer_outputs
+                            )
+                        if args.debug_layer_gradients:
+                            fn=lambda idx:(lambda grad: log_tensor(
+                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                grad.transpose(0, 1), level=args.debug_layer_gradients
+                            ))
+                            hidden_states.register_hook(fn(index))
 
                         # First Retro decoder layer returns both hidden_states
                         # and retriever_output. Make retriever_output available
