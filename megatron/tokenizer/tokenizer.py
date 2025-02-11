@@ -7,9 +7,15 @@ from abc import abstractmethod
 
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
+from transformers import PreTrainedTokenizerFast
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
+FIM_PREFIX = "<fim_prefix>"
+FIM_MIDDLE = "<fim_middle>"
+FIM_SUFFIX = "<fim_suffix>"
+FIM_PAD = "<fim_pad>"
+EOD = "<|endoftext|>"
 
 def build_tokenizer(args):
     """Initialize tokenizer."""
@@ -32,6 +38,16 @@ def build_tokenizer(args):
         assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+    elif args.tokenizer_type == 'GPT2BPETokenizerWithFIM':
+        assert args.vocab_file is not None
+        assert args.merge_file is not None
+        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
+    elif args.tokenizer_type == "TokenizerFromFile":
+        assert args.tokenizer_file is not None
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD])
+    elif args.tokenizer_type == "TokenizerFromFileWithFIM":
+        assert args.tokenizer_file is not None
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD, FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
@@ -50,6 +66,8 @@ def build_tokenizer(args):
 
     # Add vocab size (if not already set from a checkpoint).
     if getattr(args, "padded_vocab_size", None) is None:
+        # TODO: For most tokenizers, vocab_size does not take special_tokens into account.
+        #   Might cause an issue if vocab_size + len(special_tokens) exceeds padded_vocab_size?
         args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                           args)
 
@@ -202,12 +220,14 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
 class _GPT2BPETokenizer(MegatronTokenizer):
     """Original GPT2 BPE tokenizer."""
 
-    def __init__(self, vocab_file, merge_file):
+    def __init__(self, vocab_file, merge_file, special_tokens=None):
         super().__init__(vocab_file, merge_file)
 
+        special_tokens = special_tokens if special_tokens is not None else []
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
-                                       special_tokens=[], max_len=None)
+                                       special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+        self.special_tokens = self.tokenizer.special_tokens
 
     @property
     def vocab_size(self):
@@ -220,6 +240,46 @@ class _GPT2BPETokenizer(MegatronTokenizer):
     @property
     def inv_vocab(self):
         return self.tokenizer.decoder
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+
+
+class _HFTokenizer(MegatronTokenizer):
+    """HF Tokenizer."""
+
+    def __init__(self, tokenizer_file, special_tokens=None):
+        name = 'HF Tokenizer'
+        super().__init__(name)
+
+        special_tokens = special_tokens if special_tokens is not None else []
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace', max_len=None)
+        self.tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
+        self.eod_id = self.tokenizer.vocab[EOD]
+        # Token->id mapping for additional special-tokens
+        self.special_tokens = {
+            tok: self.tokenizer.vocab[tok] for tok in special_tokens
+        }
+        self._inv_vocab = {v: k for k, v in self.tokenizer.vocab.items()}
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer)
+
+    @property
+    def vocab(self):
+        return self.tokenizer.vocab
+
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)

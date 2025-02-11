@@ -2,10 +2,12 @@
 
 """Pretrain utilities."""
 
+import contextlib
 import gc
 import dataclasses
 from datetime import datetime
 import math
+import os
 import logging
 import os
 import sys
@@ -51,7 +53,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-
+from megatron.tensor_logging import get_logged_tensor_stats, reset_tensor_stats_logging
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -204,6 +206,9 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
+    if args.structured_logs_dir is not None:
+        reset_tensor_stats_logging()
+
     one_logger = get_one_logger()
     if one_logger:
         one_logger.log_metrics({
@@ -246,6 +251,8 @@ def pretrain(train_valid_test_dataset_provider,
     timers.log(['model-and-optimizer-setup',
                 'train/valid/test-data-iterators-setup'], barrier=True)
 
+    save_tensor_logs("init")
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -286,6 +293,13 @@ def pretrain(train_valid_test_dataset_provider,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
 
+def save_tensor_logs(step:str):
+    args=get_args()
+    if args.structured_logs_dir is not None and (tensor_log_stats:=get_logged_tensor_stats()):
+        tensor_logs_dir = os.path.join(args.structured_logs_dir, f"runs/0/artifacts/{torch.distributed.get_rank()}")
+        os.makedirs(tensor_logs_dir, exist_ok=True)
+        torch.save(tensor_log_stats, os.path.join(tensor_logs_dir, f"tensor_logs_{step}.pt"))
+        reset_tensor_stats_logging()
 
 def update_train_iters(args):
 
@@ -748,6 +762,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
+        tokens_per_sec_per_gpu = (args.seq_length * batch_size) / args.world_size / elapsed_time_per_iteration
         if args.log_timers_to_tensorboard:
             if writer:
                 writer.add_scalar('iteration-time',
@@ -761,22 +776,25 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
-        if args.log_throughput:
-            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+        log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+        if args.log_timers_to_tensorboard:
+            if writer:
+                writer.add_scalar('throughput', throughput, iteration)
+            if wandb_writer:
+                wandb_writer.log({'throughput': throughput}, iteration)
+        log_string += ' tokens-per-second-per-gpu: {:.2f} |'.format(tokens_per_sec_per_gpu)
+        if wandb_writer:
+            wandb_writer.log({'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu}, iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        loss_dict_avg={}
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
-                avg = total_loss_dict[key].item() / \
+                loss_dict_avg[key] = total_loss_dict[key].item() / \
                       float(max(1, total_loss_dict[advanced_iters_key]))
-                if avg > 0.0:
-                    log_string += ' {}: {:.6E} |'.format(key, avg)
+                if loss_dict_avg[key] > 0.0:
+                    log_string += ' {}: {:.6E} |'.format(key, loss_dict_avg[key])
                 total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
@@ -801,6 +819,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
+
+        # Weights and biases reporting
+        if is_last_rank() and wandb_writer is not None:
+            metrics = {
+                'learning_rate': learning_rate,
+                'consumed_samples': args.consumed_train_samples,
+                'loss_scale': loss_scale,
+                'grad_norm': grad_norm,
+                'tflops': throughput,
+                'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+                **loss_dict_avg
+            }
+            wandb_writer.log({"Training":metrics}, step=iteration)
 
     return report_memory_flag
 
@@ -922,6 +953,30 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    rank = torch.distributed.get_rank()
+    if args.torch_profile_dir is not None and rank in args.profile_ranks:
+        os.makedirs(args.torch_profile_dir, exist_ok=True)
+        def trace_fn(p: torch.profiler.profile):
+            path=os.path.join(args.torch_profile_dir, f"profile_rank_{rank}_step_{iteration}")
+            print(f"Saving trace to {path}")
+            p.export_chrome_trace(path)
+
+        schedule = torch.profiler.schedule(
+            skip_first=0,
+            warmup=args.profile_step_start,
+            wait=0,
+            active=args.profile_step_end-args.profile_step_start,
+            repeat=1,
+        )
+        profiler = torch.profiler.profile(
+            schedule=schedule,
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            on_trace_ready=trace_fn,
+            with_modules=True,
+        )
+    else:
+        profiler = None
+
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
@@ -946,7 +1001,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 'validation_iterations_time_msecs_avg': validation_iterations_time_msecs_avg
             })
 
-    while iteration < args.train_iters:
+    with contextlib.nullcontext() if profiler is None else profiler:
+      while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -996,6 +1052,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
+        if profiler is not None:
+            profiler.step()
+
+        save_tensor_logs(f"train_{iteration}")
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -1321,10 +1382,10 @@ def build_train_valid_test_data_loaders(
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
         if args.skip_train:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+            valid_dataloader = build_pretraining_data_loader(valid_ds, 0, num_workers=args.valid_num_workers)
         else:
             valid_dataloader = build_pretraining_data_loader(
-                valid_ds, args.consumed_valid_samples)
+                valid_ds, args.consumed_valid_samples, num_workers=args.valid_num_workers)
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.

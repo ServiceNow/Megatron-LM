@@ -223,7 +223,7 @@ class BlendedMegatronDatasetBuilder(object):
         # Build the mid level dataset
         mid_level_datasets = []
         for i, _split in enumerate(Split):
-            if not self.config.mock and split[i] is None:
+            if not self.config.mock and (split[i] is None or sizes[i] == 0):
                 mid_level_datasets.append(None)
             else:
                 mid_level_datasets.append(
