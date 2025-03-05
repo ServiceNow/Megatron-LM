@@ -1834,12 +1834,12 @@ class ParallelTransformer(MegatronModule):
 
                         if args.debug_layer_outputs:
                             log_tensor(
-                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                f"Global layer {index + 1} fw: Transformer layer {index} output",
                                 hidden_states.transpose(0, 1), level=args.debug_layer_outputs
                             )
                         if args.debug_layer_gradients:
                             fn=lambda idx:(lambda grad: log_tensor(
-                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                f"Global layer {idx + 2} bw: Transformer layer {idx} output",
                                 grad.transpose(0, 1), level=args.debug_layer_gradients
                             ))
                             hidden_states.register_hook(fn(index))
