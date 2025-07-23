@@ -55,6 +55,9 @@ def log_tensor(
 ):
     if level < 1:
         return
+    tensor = tensor.detach()
+    if tensor.ndim ==0:
+        tensor = tensor[None]
     save_stats = _tensor_log_stats is not None
     shape = tuple(tensor.shape)
     _, dtype = str(tensor.dtype).split("torch.")
