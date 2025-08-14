@@ -384,12 +384,12 @@ class TransformerBlock(MegatronModule):
                         )
                         if self._debug_layer_outputs:
                             log_tensor(
-                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                f"Global layer {index + 1} fw: Block {index+1} output",
                                 hidden_states.transpose(0, 1), level=self._debug_layer_outputs
                             )
                         if self._debug_layer_gradients:
                             fn=lambda idx:(lambda grad: log_tensor(
-                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                f"Global layer {idx + 2} bw: Block {idx+1} output",
                                 grad.transpose(0, 1), level=self._debug_layer_gradients
                             ))
                             hidden_states.register_hook(fn(index))
