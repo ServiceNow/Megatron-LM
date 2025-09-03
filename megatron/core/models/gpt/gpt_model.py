@@ -137,7 +137,7 @@ class GPTModel(LanguageModule):
                         if "layer_norm" in key[-1]:
                             key=[*key[:2], "norm_1", key[-1].split("_")[-1]]
                         else:
-                            key[2]="self_attn"
+                            key[2]="mixer"
                             if key[3]=="linear_qkv":
                                 key[3]="query_key_value"
                             elif key[3]=="linear_proj":
