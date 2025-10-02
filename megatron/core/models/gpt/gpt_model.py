@@ -124,11 +124,8 @@ class GPTModel(LanguageModule):
             # Store standardized parameter names for debug purposes.
             key=key.split(".")
             if key[0]=="decoder":
-                # Remove "encoder" prefix.
-                key=key[1:]
-                if key[0]=="layers":
-                    # Shift layer index.
-                    key[1]=str(int(key[1])+1)
+                if key[1]=="layers":
+                    del key[1]
                     if key[2]=="input_layernorm":
                         key[2]="norm_1"
                     elif key[2]=="pre_mlp_layernorm":
@@ -156,12 +153,12 @@ class GPTModel(LanguageModule):
                             elif key[mlp_key]=="linear_fc2":
                                 key[mlp_key]="layer_2"
                 else:
-                    assert key[0]=="final_layernorm", key[0]
-                    key=["layers",str(self.config.num_layers+1), "final_norm"]+key[1:]
+                    assert key[1]=="final_layernorm", key[1]
+                    key=["head", "final_norm"]+key[2:]
             elif key[0]=="embedding":
-                key=["layers", "0", "_".join(key[1:])]
+                key=["embeddings", "_".join(key[1:])]
             elif key[0] == "output_layer":
-                key = ["layers", str(self.config.num_layers+1), "output_weights"]
+                key = ["head", "output_weights"]
             else:
                 # Not implemented but still ok
                 pass
@@ -213,10 +210,10 @@ class GPTModel(LanguageModule):
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
             args = get_args()
             if args.debug_layer_outputs:
-                log_tensor(f"Global layer 0 fw: Embedding output", decoder_input.transpose(0, 1), level=args.debug_layer_outputs)
+                log_tensor(f"Global embeddings fw: embeddings output", decoder_input.transpose(0, 1), level=args.debug_layer_outputs)
             if args.debug_layer_gradients:
                 decoder_input.register_hook(lambda grad: log_tensor(
-                    f"Global layer 1 bw: Embedding output",
+                    f"Global decoder.0 bw: embeddings output",
                     grad.transpose(0, 1), level=args.debug_layer_gradients
                 ))
         else:

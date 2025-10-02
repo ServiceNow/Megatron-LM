@@ -1740,10 +1740,10 @@ class ParallelTransformer(MegatronModule):
 
         args = get_args()
         if args.debug_layer_outputs:
-            log_tensor(f"Global layers.0 fw: Embedding output", hidden_states.transpose(0, 1), level=args.debug_layer_outputs)
+            log_tensor(f"Global embeddings fw: embeddings output", hidden_states.transpose(0, 1), level=args.debug_layer_outputs)
         if args.debug_layer_gradients:
             hidden_states.register_hook(lambda grad: log_tensor(
-                f"Global layer 1 bw: Embedding output",
+                f"Global decoder.0 bw: embeddings output",
                 grad.transpose(0, 1), level=args.debug_layer_gradients
             ))
 
@@ -1834,12 +1834,12 @@ class ParallelTransformer(MegatronModule):
 
                         if args.debug_layer_outputs:
                             log_tensor(
-                                f"Global layer {index + 1} fw: layers.{index+1} output",
+                                f"Global decoder.{index} fw: decoder.{index} output",
                                 hidden_states.transpose(0, 1), level=args.debug_layer_outputs
                             )
                         if args.debug_layer_gradients:
                             fn=lambda idx:(lambda grad: log_tensor(
-                                f"Global layer {idx + 2} bw: layers.{idx+1} output",
+                                f"Global {"head" if idx==len(self.layers)-1 else f"decoder.{index}"} bw: decoder.{idx} output",
                                 grad.transpose(0, 1), level=args.debug_layer_gradients
                             ))
                             hidden_states.register_hook(fn(index))

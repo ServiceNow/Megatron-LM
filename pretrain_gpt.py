@@ -130,7 +130,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         )
 
     args = get_args()
-    log_tensor(f"Global layer {args.num_layers+1} fw: Loss", loss, level=args.debug_layer_outputs)
+    log_tensor(f"Global head fw: head output", loss, level=args.debug_layer_outputs)
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
