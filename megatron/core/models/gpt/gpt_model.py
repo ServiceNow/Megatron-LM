@@ -210,11 +210,11 @@ class GPTModel(LanguageModule):
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
             args = get_args()
             if args.debug_layer_outputs:
-                log_tensor(f"Global embeddings fw: embeddings output", decoder_input.transpose(0, 1), level=args.debug_layer_outputs)
+                log_tensor(f"Global embeddings fw: embeddings output", decoder_input.transpose(0, 1).flatten(0,1), level=args.debug_layer_outputs)
             if args.debug_layer_gradients:
                 decoder_input.register_hook(lambda grad: log_tensor(
                     f"Global decoder.0 bw: embeddings output",
-                    grad.transpose(0, 1), level=args.debug_layer_gradients
+                    grad.transpose(0, 1).flatten(0,1), level=args.debug_layer_gradients
                 ))
         else:
             # intermediate stage of pipeline
